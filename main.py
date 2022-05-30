@@ -1,94 +1,81 @@
-import cv2
+# YOLO object detection
+import cv2 as cv
 import numpy as np
-from scipy.stats import itemfreq
+import time
 
+WHITE = (255, 255, 255)
+img = None
+img0 = None
+outputs = None
+cap=cv.VideoCapture(0)
+# Load names of classes and get random colors
+classes = open('coco.names').read().strip().split('\n')
+np.random.seed(42)
+colors = np.random.randint(0, 255, size=(len(classes), 3), dtype='uint8')
 
-def get_dominant_color(image, n_colors):
-    pixels = np.float32(image).reshape((-1, 3))
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
-    flags = cv2.KMEANS_RANDOM_CENTERS
-    flags, labels, centroids = cv2.kmeans(
-        pixels, n_colors, None, criteria, 10, flags)
-    palette = np.uint8(centroids)
-    return palette[np.argmax(itemfreq(labels)[:, -1])]
+# Give the configuration and weight files for the model and load the network.
+net = cv.dnn.readNetFromDarknet('yolov3-tiny.cfg', 'yolov3-tiny.weights')
+net.setPreferableBackend(cv.dnn.DNN_BACKEND_OPENCV)
+# net.setPreferableTarget(cv.dnn.DNN_TARGET_CPU)
 
-
-clicked = False
-def onMouse(event, x, y, flags, param):
-    global clicked
-    if event == cv2.EVENT_LBUTTONUP:
-        clicked = True
-
-
-cameraCapture = cv2.VideoCapture(0)
-cv2.namedWindow('camera')
-cv2.setMouseCallback('camera', onMouse)
-
-# Read and process frames in loop
-success, frame = cameraCapture.read()
+# determine the output layer
+ln = net.getLayerNames()
+ln = [ln[i - 1] for i in net.getUnconnectedOutLayers()]
 
 
 
+l=250
+while True:
 
-while success and not clicked:
-    cv2.waitKey(1)
-    success, frame = cameraCapture.read()
+    _,img0 = cap.read()
+    img = img0.copy()
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    img = cv2.medianBlur(gray, 37)
-    circles = cv2.HoughCircles(img, cv2.HOUGH_GRADIENT,
-                              1, 50, param1=120, param2=40)
+    blob = cv.dnn.blobFromImage(img, 1 / 255.0, (l, l), swapRB=True, crop=False)
 
-    if not circles is None:
-        circles = np.uint16(np.around(circles))
-        max_r, max_i = 0, 0
-        for i in range(len(circles[:, :, 2][0])):
-            if circles[:, :, 2][0][i] > 50 and circles[:, :, 2][0][i] > max_r:
-                max_i = i
-                max_r = circles[:, :, 2][0][i]
-        x, y, r = circles[:, :, :][0][max_i]
-        if y > r and x > r:
-            square = frame[y-r:y+r, x-r:x+r]
+    net.setInput(blob)
+    t0 = time.time()
+    outputs = net.forward(ln)
+    t = time.time() - t0
 
-            dominant_color = get_dominant_color(square, 2)
-            if dominant_color[2] > 100:
-                print("STOP")
-            elif dominant_color[0] > 80:
-                zone_0 = square[square.shape[0]*3//8:square.shape[0]
-                                * 5//8, square.shape[1]*1//8:square.shape[1]*3//8]
-                cv2.imshow('Zone0', zone_0)
-                zone_0_color = get_dominant_color(zone_0, 1)
+    # combine the 3 output groups into 1 (10647, 85)
+    # large objects (507, 85)
+    # medium objects (2028, 85)
+    # small objects (8112, 85)
+    outputs = np.vstack(outputs)
 
-                zone_1 = square[square.shape[0]*1//8:square.shape[0]
-                                * 3//8, square.shape[1]*3//8:square.shape[1]*5//8]
-                cv2.imshow('Zone1', zone_1)
-                zone_1_color = get_dominant_color(zone_1, 1)
+    H, W = img.shape[:2]
 
-                zone_2 = square[square.shape[0]*3//8:square.shape[0]
-                                * 5//8, square.shape[1]*5//8:square.shape[1]*7//8]
-                cv2.imshow('Zone2', zone_2)
-                zone_2_color = get_dominant_color(zone_2, 1)
+    boxes = []
+    confidences = []
+    classIDs = []
 
-                if zone_1_color[2] < 60:
-                    if sum(zone_0_color) > sum(zone_2_color):
-                        print("LEFT")
-                    else:
-                        print("RIGHT")
-                else:
-                    if sum(zone_1_color) > sum(zone_0_color) and sum(zone_1_color) > sum(zone_2_color):
-                        print("FORWARD")
-                    elif sum(zone_0_color) > sum(zone_2_color):
-                        print("FORWARD AND LEFT")
-                    else:
-                        print("FORWARD AND RIGHT")
-            else:
-                print("N/A")
+    for output in outputs:
+        scores = output[5:]
+        classID = np.argmax(scores)
+        confidence = scores[classID]
+        if confidence > 0.7:
+            x, y, w, h = output[:4] * np.array([W, H, W, H])
+            p0 = int(x - w // 2), int(y - h // 2)
+            p1 = int(x + w // 2), int(y + h // 2)
+            boxes.append([*p0, int(w), int(h)])
+            confidences.append(float(confidence))
+            classIDs.append(classID)
+            # cv.rectangle(img, p0, p1, WHITE, 1)
 
-        for i in circles[0, :]:
-            cv2.circle(frame, (i[0], i[1]), i[2], (0, 255, 0), 2)
-            cv2.circle(frame, (i[0], i[1]), 2, (0, 0, 255), 3)
-    cv2.imshow('camera', frame)
+    indices = cv.dnn.NMSBoxes(boxes, confidences, 0.7, 0.7 - 0.1)
+    if len(indices) > 0:
+        for i in indices.flatten():
+            (x, y) = (boxes[i][0], boxes[i][1])
+            (w, h) = (boxes[i][2], boxes[i][3])
+            color = [int(c) for c in colors[classIDs[i]]]
+            cv.rectangle(img, (x, y), (x + w, y + h), color, 2)
+            text = "{}: {:.4f}".format(classes[classIDs[i]], confidences[i])
+            cv.putText(img, text, (x, y - 5), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    cv.imshow("img",img)
+    if cv.waitKey(1) & 0xFF==ord('q'):
+        break
 
 
-cv2.destroyAllWindows()
-cameraCapture.release()
+
+cv.destroyAllWindows()
